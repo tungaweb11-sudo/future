@@ -30,7 +30,8 @@ class AviatorPredictor:
         return keras
 
     def normalize(self, values: List[float]) -> List[float]:
-        return [math.log(min(max(float(value), 1.0), 100.0)) / math.log(100.0) for value in values]
+        # log-scale normalisation capped at 100× — maps 1.0→0, 100×→1
+        return [math.log(min(max(float(v), 1.0), 100.0)) / math.log(100.0) for v in values]
 
     def create_sequences(self, multipliers: List[float]) -> Tuple[List[List[float]], List[int]]:
         if len(multipliers) <= self.sequence_length:
@@ -50,10 +51,10 @@ class AviatorPredictor:
         model = keras.Sequential(
             [
                 keras.layers.Input(shape=(self.sequence_length, 1)),
-                keras.layers.LSTM(64, return_sequences=True),
+                keras.layers.LSTM(128, return_sequences=True),
                 keras.layers.Dropout(0.25),
-                keras.layers.LSTM(32),
-                keras.layers.Dense(32, activation="relu"),
+                keras.layers.LSTM(64),
+                keras.layers.Dense(64, activation="relu"),
                 keras.layers.Dropout(0.2),
                 keras.layers.Dense(len(CATEGORIES), activation="softmax"),
             ]
@@ -124,8 +125,9 @@ class AviatorPredictor:
 
     def train_fallback(self, multipliers: List[float]) -> Dict[str, float]:
         labels = [self.category_index(value) for value in multipliers]
-        counts = {category: 1 for category in CATEGORIES}
-        transitions = {category: {next_category: 1 for next_category in CATEGORIES} for category in CATEGORIES}
+        # Laplace-smoothed counts
+        counts = {cat: 2 for cat in CATEGORIES}
+        transitions = {cat: {nxt: 1 for nxt in CATEGORIES} for cat in CATEGORIES}
 
         for index, label in enumerate(labels):
             category = CATEGORIES[label]
@@ -143,7 +145,8 @@ class AviatorPredictor:
             },
         )
 
-        baseline = max(counts.values()) / sum(counts.values()) * 100
+        total = sum(counts.values())
+        baseline = max(counts.values()) / total * 100
         return {
             "train_accuracy": round(baseline, 2),
             "validation_accuracy": round(baseline, 2),
@@ -184,36 +187,60 @@ class AviatorPredictor:
 
     def predict_fallback(self, multipliers: List[float]) -> Dict[str, object]:
         payload = read_json(FALLBACK_MODEL_PATH, {})
-        counts = payload.get("counts", {category: 1 for category in CATEGORIES})
+        counts      = payload.get("counts",      {cat: 2 for cat in CATEGORIES})
         transitions = payload.get("transitions", {})
-        last_category = CATEGORIES[self.category_index(multipliers[-1])]
-        transition_counts = transitions.get(last_category, counts)
 
-        recent = [CATEGORIES[self.category_index(value)] for value in multipliers[-self.sequence_length:]]
-        scores = {}
-        for category in CATEGORIES:
-            score = float(counts.get(category, 1)) * 0.35
-            score += float(transition_counts.get(category, 1)) * 0.45
-            score += recent.count(category) * 0.20
-            scores[category] = score
+        # Last round category drives transition signal
+        last_cat  = CATEGORIES[self.category_index(multipliers[-1])]
+        trans     = transitions.get(last_cat, counts)
 
-        total = sum(scores.values()) or 1.0
-        probabilities = {category: (score / total) * 100 for category, score in scores.items()}
-        prediction = max(probabilities, key=probabilities.get)
-        confidence = round(probabilities[prediction], 2)
+        # Recent window (last 5 rounds) for momentum
+        recent = [CATEGORIES[self.category_index(v)] for v in multipliers[-5:]]
+        recent_counts = {cat: recent.count(cat) for cat in CATEGORIES}
+
+        total_counts  = max(sum(counts.values()), 1)
+        total_trans   = max(sum(trans.values()), 1)
+        total_recent  = max(sum(recent_counts.values()), 1)
+
+        # Weights: 25% base freq, 50% transition from last round, 25% recent momentum
+        scores = {
+            cat: (
+                (counts.get(cat, 1) / total_counts)        * 25.0 +
+                (trans.get(cat, 1)  / total_trans)         * 50.0 +
+                (recent_counts.get(cat, 0) / total_recent) * 25.0
+            )
+            for cat in CATEGORIES
+        }
+
+        total_score = sum(scores.values()) or 1.0
+        raw = {cat: scores[cat] / total_score * 100 for cat in CATEGORIES}
+
+        # Force probabilities to sum exactly to 100.0
+        rounded = {cat: round(raw[cat], 2) for cat in CATEGORIES}
+        diff = round(100.0 - sum(rounded.values()), 2)
+        top  = max(rounded, key=rounded.get)
+        rounded[top] = round(rounded[top] + diff, 2)
+
+        prediction = max(rounded, key=rounded.get)
+        confidence  = rounded[prediction]
+
         return {
-            "prediction": prediction,
-            "confidence": confidence,
+            "prediction":          prediction,
+            "confidence":          confidence,
             "recommended_cashout": category_to_recommended_cashout(prediction, confidence),
-            "risk_level": risk_level(prediction, confidence),
-            "probabilities": {category: round(value, 2) for category, value in probabilities.items()},
-            "engine": "stdlib_fallback",
+            "risk_level":          risk_level(prediction, confidence),
+            "probabilities":       rounded,
+            "engine":              "stdlib_fallback",
         }
 
     @staticmethod
     def category_index(multiplier: float) -> int:
-        if multiplier < 1.5:
-            return 0
-        if multiplier < 5.0:
-            return 1
-        return 2
+        if multiplier < 1.50:
+            return 0   # VERY_LOW
+        if multiplier < 2.00:
+            return 1   # LOW
+        if multiplier < 5.00:
+            return 2   # MEDIUM
+        if multiplier < 15.0:
+            return 3   # HIGH
+        return 4       # VERY_HIGH

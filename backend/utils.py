@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -8,17 +9,36 @@ from typing import Any, Dict, List
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
 ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts"
-ROUND_HISTORY_PATH = DATA_DIR / "roundhistory.json"
-DECISIONS_PATH = ROOT_DIR / "decisions.json"
+ROUND_HISTORY_PATH = DATA_DIR / "example.roundhistory.json"
+DECISIONS_PATH     = DATA_DIR / "decisions.json"
 LOG_PATH = Path(__file__).resolve().parent / "aviator-api.log"
 METADATA_PATH = ARTIFACT_DIR / "metadata.json"
 
-CATEGORIES = ["LOW", "MEDIUM", "HIGH"]
+# Per-file write locks — prevents race conditions when multiple threads write simultaneously
+_write_locks: Dict[str, threading.Lock] = {}
+_write_locks_lock = threading.Lock()
+
+def _get_write_lock(path: Path) -> threading.Lock:
+    key = str(path)
+    with _write_locks_lock:
+        if key not in _write_locks:
+            _write_locks[key] = threading.Lock()
+        return _write_locks[key]
+
+# 5-bin classification for better prediction granularity
+CATEGORIES = ["VERY_LOW", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"]
 CATEGORY_RANGES = {
-    "LOW": (1.0, 1.5),
-    "MEDIUM": (1.5, 4.0),
-    "HIGH": (5.0, 100.0),
+    "VERY_LOW":  (1.00, 1.50),
+    "LOW":       (1.50, 2.00),
+    "MEDIUM":    (2.00, 5.00),
+    "HIGH":      (5.00, 15.0),
+    "VERY_HIGH": (15.0, 999.0),
 }
+
+# Single source of truth for confidence thresholds
+MIN_CONFIDENCE = 70.0              # TF model: below this = low_confidence
+MIN_CONFIDENCE_TO_STORE = 25.0     # minimum to persist a decision (TF engine ~30-50%)
+MIN_CONFIDENCE_STATISTICAL = 22.0  # statistical_ensemble ceiling is lower (~25-35%)
 
 
 def setup_logging() -> None:
@@ -63,19 +83,31 @@ def read_json(path: Path, default: Any) -> Any:
     try:
         if not path.exists():
             return default
-        with path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except json.JSONDecodeError:
+        content = path.read_text(encoding="utf-8").strip()
+        if not content:
+            return default
+        return json.loads(content)
+    except (json.JSONDecodeError, OSError):
         logging.exception("Invalid JSON in %s", path)
         return default
 
 
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-    os.replace(tmp_path, path)
+    lock = _get_write_lock(path)
+    with lock:
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp_path.write_text(
+                json.dumps(payload, indent=2), encoding="utf-8"
+            )
+            tmp_path.replace(path)
+        except OSError:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
 
 def load_round_history() -> List[Dict[str, Any]]:
@@ -110,29 +142,41 @@ def load_round_history() -> List[Dict[str, Any]]:
 
 
 def multiplier_to_category(multiplier: float) -> str:
-    if multiplier < 1.5:
+    if multiplier < 1.50:
+        return "VERY_LOW"
+    if multiplier < 2.00:
         return "LOW"
-    if multiplier < 5.0:
+    if multiplier < 5.00:
         return "MEDIUM"
-    return "HIGH"
+    if multiplier < 15.0:
+        return "HIGH"
+    return "VERY_HIGH"
 
 
+# Recommended cashout: conservative target based on category + confidence.
+# Formula: base × (1 + confidence_bonus) — always below the expected crash point.
 def category_to_recommended_cashout(category: str, confidence: float) -> float:
-    confidence_ratio = max(0.0, min(confidence, 100.0)) / 100.0
-    if category == "LOW":
-        return round(1.15 + 0.20 * confidence_ratio, 2)
-    if category == "MEDIUM":
-        return round(1.75 + 1.25 * confidence_ratio, 2)
-    return round(2.5 + 2.5 * confidence_ratio, 2)
+    conf = max(0.0, min(confidence, 100.0)) / 100.0
+    targets = {
+        "VERY_LOW":  (1.10, 1.30),   # base, max
+        "LOW":       (1.30, 1.70),
+        "MEDIUM":    (1.70, 2.80),
+        "HIGH":      (2.80, 5.50),
+        "VERY_HIGH": (5.50, 12.0),
+    }
+    base, top = targets.get(category, (1.20, 1.80))
+    return round(base + (top - base) * conf, 2)
 
 
 def risk_level(category: str, confidence: float) -> str:
-    if confidence < 55:
+    """Risk to the PLAYER (not the house): higher multiplier target = higher risk."""
+    if category in ("HIGH", "VERY_HIGH"):
+        if confidence >= 75:
+            return "MEDIUM"
         return "HIGH"
-    if category == "HIGH" and confidence < 75:
-        return "HIGH"
-    if category == "MEDIUM" or confidence < 80:
-        return "MEDIUM"
+    if category == "MEDIUM":
+        return "MEDIUM" if confidence < 70 else "LOW"
+    # VERY_LOW / LOW — safe targets, low risk
     return "LOW"
 
 
@@ -142,5 +186,6 @@ def append_decision(decision: Dict[str, Any]) -> None:
         decisions = []
     decisions.append(decision)
     write_json(DECISIONS_PATH, decisions[-250:])
+
 
 

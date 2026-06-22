@@ -130,12 +130,22 @@ def _pid_is_bot(pid: Any) -> bool:
         return False
     cmdline_path = Path("/proc") / str(pid_int) / "cmdline"
     if not cmdline_path.exists():
-        return True
+        # Process may have just exited
+        return False
     try:
         cmdline = cmdline_path.read_text(encoding="utf-8", errors="replace").replace("\x00", " ")
     except OSError:
         return False
-    return "node" in cmdline and str(BOT_SCRIPT) in cmdline
+    # Accept if it's our specific bot script, OR if it's a node process that
+    # was started by us (managed _process) and is still in early initialisation
+    # (cmdline may not yet show the full script path on some kernels).
+    if "node" in cmdline and str(BOT_SCRIPT) in cmdline:
+        return True
+    # Fallback: if we own the managed process and it's still alive, trust it
+    global _process
+    if _process is not None and _process.pid == pid_int and _process.poll() is None:
+        return "node" in cmdline
+    return False
 
 
 def _pid_is_bot_alive(pid: Any) -> bool:
@@ -314,18 +324,23 @@ def stop() -> Dict[str, Any]:
 
 
 def _try_read_pipes() -> None:
-    """Read any remaining data from stdout/stderr so the pipe buffer doesn't stall."""
+    """
+    Close any open log-file handle attached to the subprocess stdout.
+
+    The subprocess is launched with stdout redirected to a log file
+    (not subprocess.PIPE), so _process.stdout is None — there is nothing
+    to read.  We simply make sure the Popen object is fully cleaned up.
+    """
     global _process
     if _process is None:
         return
+    # stdout/stderr are file objects (or None) when launched with a file handle.
+    # Calling communicate() on an already-finished process is safe and drains
+    # any internal buffers without blocking.
     try:
-        if _process.stdout and not _process.stdout.closed:
-            _process.stdout.read()
-    except Exception:
-        pass
-    try:
-        if _process.stderr and not _process.stderr.closed:
-            _process.stderr.read()
+        if _process.poll() is not None:
+            # Process already finished — communicate() returns immediately.
+            _process.communicate(timeout=1)
     except Exception:
         pass
 

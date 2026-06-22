@@ -1,3 +1,4 @@
+import statistics
 """
 Professional Aviator Risk Management Engine.
 
@@ -10,7 +11,7 @@ Calculates risk metrics from crash history:
 """
 
 import math
-import statistics
+import risk_statistics
 from typing import Any, Dict, List, Tuple
 
 
@@ -37,10 +38,14 @@ def _sma(data: List[float], period: int) -> float:
 
 def _category(multiplier: float) -> str:
     if multiplier < 1.5:
+        return "VERY_LOW"
+    if multiplier < 2.0:
         return "LOW"
     if multiplier < 5.0:
         return "MEDIUM"
-    return "HIGH"
+    if multiplier < 15.0:
+        return "HIGH"
+    return "VERY_HIGH"
 
 
 # ── Public API ───────────────────────────────────────────────────────
@@ -83,14 +88,14 @@ def detect_streaks(multipliers: List[float]) -> Dict[str, Any]:
     if not multipliers:
         return {
             "current_streak": {"category": None, "length": 0, "active": False},
-            "longest_streaks": {"LOW": 0, "MEDIUM": 0, "HIGH": 0},
+            "longest_streaks": {"VERY_LOW": 0, "LOW": 0, "MEDIUM": 0, "HIGH": 0, "VERY_HIGH": 0},
             "recent_streaks": [],
         }
 
     categories = [_category(m) for m in multipliers]
 
     # ── full-history streaks ──
-    longest: Dict[str, int] = {"LOW": 0, "MEDIUM": 0, "HIGH": 0}
+    longest: Dict[str, int] = {"VERY_LOW": 0, "LOW": 0, "MEDIUM": 0, "HIGH": 0, "VERY_HIGH": 0}
     all_streaks: List[Dict[str, Any]] = []
     current_cat = categories[0]
     current_len = 1
@@ -184,7 +189,7 @@ def compute_risk_index(
     mas = compute_moving_averages(multipliers)
 
     recent = multipliers[-50:] if len(multipliers) >= 50 else multipliers
-    high_count = sum(1 for m in recent if _category(m) == "HIGH")
+    high_count = sum(1 for m in recent if _category(m) in ("HIGH", "VERY_HIGH"))
     high_ratio = high_count / len(recent)
 
     # ── factor scores (each 0-100) ──
@@ -194,9 +199,9 @@ def compute_risk_index(
 
     # 2. Streak factor
     cs = streaks["current_streak"]
-    if cs["category"] == "HIGH" and cs["active"]:
+    if cs["category"] in ("HIGH", "VERY_HIGH") and cs["active"]:
         streak_factor = min(100, 40 + cs["length"] * 10)
-    elif cs["category"] == "LOW" and cs["length"] > 5:
+    elif cs["category"] in ("VERY_LOW", "LOW") and cs["length"] > 5:
         streak_factor = min(100, 30 + (cs["length"] - 5) * 8)
     elif cs["category"] == "MEDIUM" and cs["length"] > 4:
         streak_factor = min(100, 25 + (cs["length"] - 4) * 10)
@@ -274,7 +279,13 @@ def compute_round_summary(rounds: List[Dict[str, Any]]) -> Dict[str, Any]:
         }
 
     cats = [_category(m) for m in multipliers]
-    counts = {"LOW": cats.count("LOW"), "MEDIUM": cats.count("MEDIUM"), "HIGH": cats.count("HIGH")}
+    counts = {
+        "VERY_LOW":  cats.count("VERY_LOW"),
+        "LOW":       cats.count("LOW"),
+        "MEDIUM":    cats.count("MEDIUM"),
+        "HIGH":      cats.count("HIGH"),
+        "VERY_HIGH": cats.count("VERY_HIGH"),
+    }
 
     # Recent trend: compare last 10 vs previous 10
     if total >= 20:
