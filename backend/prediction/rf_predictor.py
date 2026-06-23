@@ -157,9 +157,7 @@ def blend_predictions(
 ) -> Dict:
     """
     Blend LSTM and RF probability vectors.
-
-    When both engines are available, the blended probabilities
-    are more calibrated than either model alone.
+    NaN-safe: any bad probability value is replaced with uniform before blending.
     Returns the LSTM result unchanged if RF is unavailable.
     """
     if rf_result is None:
@@ -167,17 +165,26 @@ def blend_predictions(
 
     import math
 
+    def _safe_prob(probs: Dict, cat: str) -> float:
+        """Get a probability value, returning uniform fallback if NaN/missing."""
+        v = probs.get(cat, 0.0)
+        try:
+            fv = float(v)
+            return fv if math.isfinite(fv) else 100.0 / NUM_CLASSES
+        except (TypeError, ValueError):
+            return 100.0 / NUM_CLASSES
+
     lstm_probs = lstm_result.get("probabilities", {})
     rf_probs   = rf_result.get("probabilities", {})
 
-    # Weighted average of probability vectors
+    # Weighted average — NaN-safe
     blended = {}
     for cat in CATEGORIES:
-        lp = lstm_probs.get(cat, 0.0) / 100.0
-        rp = rf_probs.get(cat,   0.0) / 100.0
+        lp = _safe_prob(lstm_probs, cat) / 100.0
+        rp = _safe_prob(rf_probs,   cat) / 100.0
         blended[cat] = lstm_weight * lp + rf_weight * rp
 
-    # Normalise
+    # Normalise to exactly 100%
     total = sum(blended.values()) or 1.0
     blended = {c: round(v / total * 100, 2) for c, v in blended.items()}
     diff    = round(100.0 - sum(blended.values()), 2)
@@ -187,21 +194,23 @@ def blend_predictions(
     prediction = max(blended, key=blended.get)
     confidence = blended[prediction]
 
-    # Pick higher-confidence model's contextual signals
-    if rf_result.get("confidence", 0) > lstm_result.get("confidence", 0):
-        regime     = rf_result.get("regime")
-        streak     = rf_result.get("streak")
-        trend      = rf_result.get("trend")
-        action     = rf_result.get("action")
-        bet_frac   = rf_result.get("bet_fraction", 0.0)
-    else:
-        regime     = lstm_result.get("regime")
-        streak     = lstm_result.get("streak")
-        trend      = lstm_result.get("trend")
-        action     = lstm_result.get("action")
-        bet_frac   = lstm_result.get("bet_fraction", 0.0)
+    # Safe confidence values for metadata
+    lstm_conf = lstm_result.get("confidence", 0.0)
+    rf_conf   = rf_result.get("confidence", 0.0)
+    lstm_conf = lstm_conf if math.isfinite(float(lstm_conf or 0)) else 0.0
+    rf_conf   = rf_conf   if math.isfinite(float(rf_conf   or 0)) else 0.0
 
-    # Recalculate action/bet_fraction based on blended confidence
+    # Pick contextual signals from higher-confidence model
+    if rf_conf > lstm_conf:
+        regime   = rf_result.get("regime")
+        streak   = rf_result.get("streak")
+        trend    = rf_result.get("trend")
+    else:
+        regime   = lstm_result.get("regime")
+        streak   = lstm_result.get("streak")
+        trend    = lstm_result.get("trend")
+
+    # Recalculate action/bet_fraction from blended confidence
     from prediction.statistical_predictor import get_risk_params
     min_conf, bet_base = get_risk_params(prediction, regime or "medium")
     if confidence >= min_conf:
@@ -220,8 +229,8 @@ def blend_predictions(
         "risk_level":          _risk(prediction, confidence),
         "probabilities":       blended,
         "engine":              "lstm_rf_ensemble",
-        "lstm_confidence":     lstm_result.get("confidence"),
-        "rf_confidence":       rf_result.get("confidence"),
+        "lstm_confidence":     lstm_conf,
+        "rf_confidence":       rf_conf,
         "regime":              regime,
         "streak":              streak,
         "trend":               trend,

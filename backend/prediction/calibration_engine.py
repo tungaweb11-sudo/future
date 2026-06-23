@@ -446,9 +446,33 @@ class CalibrationEngine:
         with self._lock:
             self._ensure_initialised()
 
-            model_probs = prediction_result.get("probabilities", {})
+            # ── Sanitize incoming probabilities — guard against NaN/Inf ──
+            raw_probs = prediction_result.get("probabilities", {})
+            import math as _math
+
+            def _is_bad(v) -> bool:
+                try:
+                    return not _math.isfinite(float(v))
+                except (TypeError, ValueError):
+                    return True
+
+            # If any probability is bad, fall back to uniform distribution
+            if any(_is_bad(v) for v in raw_probs.values()) or not raw_probs:
+                uniform = round(100.0 / len(CATEGORIES), 2)
+                model_probs = {c: uniform for c in CATEGORIES}
+                # Fix rounding so they sum to exactly 100
+                model_probs[CATEGORIES[0]] = round(
+                    100.0 - uniform * (len(CATEGORIES) - 1), 2
+                )
+            else:
+                model_probs = {c: float(raw_probs.get(c, 0.0)) for c in CATEGORIES}
+
             bayes_weight = min(0.35, 0.05 + self._bayes._n_updates * 0.002)
             blended_probs = self._bayes.blend(model_probs, weight=bayes_weight)
+
+            # Sanitize blended output too
+            if any(_is_bad(v) for v in blended_probs.values()):
+                blended_probs = model_probs
 
             # Re-derive prediction from blended probs
             blended_prediction = max(blended_probs, key=blended_probs.get)
@@ -471,7 +495,7 @@ class CalibrationEngine:
                 "confidence":           blended_confidence,
                 "bayes_weight":         round(bayes_weight, 4),
                 "raw_prediction":       prediction_result.get("prediction"),
-                "raw_probabilities":    model_probs,
+                "raw_probabilities":    model_probs,  # sanitized
                 # Recalibration state
                 "recalibration_active": recal_active,
                 "recalibration_reason": recal_override,
