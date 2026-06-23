@@ -224,11 +224,15 @@ def _fit_seq_scaler(X_train_np):
 
 
 def _apply_seq_scaler(scaler, X_np):
-    """Apply a fitted scaler to a (N, 20, 8) array."""
+    """Apply a fitted scaler to a (N, 20, 8) array. Returns NaN-safe output."""
     import numpy as np
     n, s, f = X_np.shape
     flat    = X_np.reshape(n, s * f)
+    # Replace any NaN/Inf in input before scaling
+    flat    = np.nan_to_num(flat, nan=0.0, posinf=1.0, neginf=-1.0)
     flat_s  = scaler.transform(flat)
+    # Guard output too
+    flat_s  = np.nan_to_num(flat_s, nan=0.0, posinf=3.0, neginf=-3.0)
     return flat_s.reshape(n, s, f).astype("float32")
 
 
